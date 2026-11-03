@@ -405,6 +405,12 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onOneFingerPanUpdate(DragUpdateDetails d) async {
+    if (kRDFixTrace) {
+      print('[RDFIX] 1f update delta=(${d.delta.dx.toStringAsFixed(1)},'
+          '${d.delta.dy.toStringAsFixed(1)}) pos=(${d.localPosition.dx.toStringAsFixed(1)},'
+          '${d.localPosition.dy.toStringAsFixed(1)}) touchBased=${!isNotTouchBasedDevice()} '
+          'handleTouch=$handleTouch panStarted=$_touchModePanStarted');
+    }
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -452,6 +458,10 @@ class _RawTouchGestureDetectorRegionState
     if (isNotTouchBasedDevice()) {
       return;
     }
+    if (kRDFixTrace) {
+      print('[RDFIX] twoFinger START ptrCount=${d.pointerCount} '
+          'locked=$canvasLocked specialHold=$isSpecialHoldDragActive');
+    }
     if (isSpecialHoldDragActive) {
       // Initialize the last focal point to calculate deltas manually.
       _lastSpecialHoldDragFocalPoint = d.focalPoint;
@@ -461,6 +471,12 @@ class _RawTouchGestureDetectorRegionState
   onTwoFingerScaleUpdate(ScaleUpdateDetails d) async {
     if (isNotTouchBasedDevice()) {
       return;
+    }
+    if (kRDFixTrace) {
+      print('[RDFIX] twoFinger rawScale=${d.scale.toStringAsFixed(5)} '
+          'ptrCount=${d.pointerCount} lastScale=${_scale.toStringAsFixed(4)} '
+          'canvasLocked=$canvasLocked touchMode=$handleTouch '
+          'canvasScale=${ffi.canvasModel.scale.toStringAsFixed(4)}');
     }
 
     // If in special drag mode, perform a pan instead of a scale.

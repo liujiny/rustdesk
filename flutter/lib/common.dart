@@ -1472,6 +1472,16 @@ String readableFileSize(double size) {
 /// This will happen in Android AccessibilityService Input
 /// android can't init dispatching size yet ,see: https://stackoverflow.com/questions/59960451/android-accessibility-dispatchgesture-is-it-possible-to-specify-pressure-for-a
 /// use this temporary solution until flutter or android fixes the bug
+// [RDFIX] Android reports PointerEvent.size == 1.0 for ordinary contacts on
+// some touch panels (this Motorola reports it for *every* contact). The
+// workaround below then re-dispatches each physical touch as a second pointer,
+// so one finger is seen as two: taps become the double-tap path (right click),
+// a one-finger drag is classified as a two-finger gesture, and the duplicate
+// pointer can be left behind as a ghost contact. Disabled by default; turn it
+// back on only for devices where accessibility-injected input really does lose
+// its move events.
+const bool kEnablePointerSize1Workaround = false;
+
 class AccessibilityListener extends StatelessWidget {
   final Widget? child;
   static final offset = 100;
@@ -1482,7 +1492,7 @@ class AccessibilityListener extends StatelessWidget {
   Widget build(BuildContext context) {
     return Listener(
         onPointerDown: (evt) {
-          if (evt.size == 1) {
+          if (kEnablePointerSize1Workaround && evt.size == 1) {
             GestureBinding.instance.handlePointerEvent(PointerAddedEvent(
                 pointer: evt.pointer + offset, position: evt.position));
             GestureBinding.instance.handlePointerEvent(PointerDownEvent(
@@ -1492,7 +1502,7 @@ class AccessibilityListener extends StatelessWidget {
           }
         },
         onPointerUp: (evt) {
-          if (evt.size == 1) {
+          if (kEnablePointerSize1Workaround && evt.size == 1) {
             GestureBinding.instance.handlePointerEvent(PointerUpEvent(
                 pointer: evt.pointer + offset,
                 size: 0.1,
@@ -1502,7 +1512,7 @@ class AccessibilityListener extends StatelessWidget {
           }
         },
         onPointerMove: (evt) {
-          if (evt.size == 1) {
+          if (kEnablePointerSize1Workaround && evt.size == 1) {
             GestureBinding.instance.handlePointerEvent(PointerMoveEvent(
                 pointer: evt.pointer + offset,
                 size: 0.1,

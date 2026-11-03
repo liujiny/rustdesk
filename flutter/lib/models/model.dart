@@ -2708,8 +2708,36 @@ class CanvasModel with ChangeNotifier {
     notifyListeners();
   }
 
+  // [RDFIX] Keep the remote image covering the viewport: clamp the canvas
+  // offset so zooming/panning can never push the picture off the screen.
+  void _clampCanvasOffset() {
+    final rect = parent.target?.ffiModel.rect;
+    if (rect == null ||
+        rect.width <= 0 ||
+        rect.height <= 0 ||
+        !_scale.isFinite ||
+        _scale <= 0) {
+      return;
+    }
+    final size = getSize();
+    if (size.width <= 0 || size.height <= 0) return;
+    final dw = rect.width * _scale;
+    final dh = rect.height * _scale;
+    if (dw >= size.width) {
+      _x = _x.clamp(size.width - dw, 0.0).toDouble();
+    } else {
+      _x = (size.width - dw) / 2;
+    }
+    if (dh >= size.height) {
+      _y = _y.clamp(size.height - dh, 0.0).toDouble();
+    } else {
+      _y = (size.height - dh) / 2;
+    }
+  }
+
   panX(double dx) {
     _x += dx;
+    _clampCanvasOffset();
     if (isMobile) {
       isMobileCanvasChanged = true;
     }
@@ -2727,6 +2755,7 @@ class CanvasModel with ChangeNotifier {
 
   panY(double dy) {
     _y += dy;
+    _clampCanvasOffset();
     if (isMobile) {
       isMobileCanvasChanged = true;
     }
@@ -2736,12 +2765,26 @@ class CanvasModel with ChangeNotifier {
   // mobile only
   updateScale(double v, Offset focalPoint) {
     if (parent.target?.imageModel.image == null) return;
+    // [RDFIX] a zero/Infinity/NaN factor would slam the canvas to min/max zoom
+    // (and fling the offset out of the viewport on the next frame).
+    if (!v.isFinite || v <= 0.0) {
+      if (kRDFixTrace) {
+        print('[RDFIX] updateScale IGNORED non-finite v=$v');
+      }
+      return;
+    }
     final s = _scale;
     _scale *= v;
     final maxs = parent.target?.imageModel.maxScale ?? 1;
     final mins = parent.target?.imageModel.minScale ?? 1;
     if (_scale > maxs) _scale = maxs;
     if (_scale < mins) _scale = mins;
+    if (kRDFixTrace) {
+      print('[RDFIX] updateScale v=${v.toStringAsFixed(4)} '
+          's0=${s.toStringAsFixed(4)} s1=${_scale.toStringAsFixed(4)} '
+          'min=$mins max=$maxs focal=(${focalPoint.dx.toStringAsFixed(1)},'
+          '${focalPoint.dy.toStringAsFixed(1)})');
+    }
     // (focalPoint.dx - _x_1) / s1 + displayOriginX = (focalPoint.dx - _x_2) / s2 + displayOriginX
     // _x_2 = focalPoint.dx - (focalPoint.dx - _x_1) / s1 * s2
     _x = focalPoint.dx - (focalPoint.dx - _x) / s * _scale;
@@ -2749,6 +2792,7 @@ class CanvasModel with ChangeNotifier {
     // (focalPoint.dy - _y_1 - adjust) / s1 + displayOriginY = (focalPoint.dy - _y_2 - adjust) / s2 + displayOriginY
     // _y_2 = focalPoint.dy - adjust - (focalPoint.dy - _y_1 - adjust) / s1 * s2
     _y = focalPoint.dy - adjust - (focalPoint.dy - _y - adjust) / s * _scale;
+    _clampCanvasOffset();
     if (isMobile) {
       isMobileCanvasChanged = true;
     }
@@ -3097,6 +3141,9 @@ class PredefinedCursor {
   }
 }
 
+// [RDFIX] debug telemetry switch
+const bool kRDFixTrace = true;
+
 class CursorModel with ChangeNotifier {
   ui.Image? _image;
   final _images = <String, Tuple3<ui.Image, double, double>>{};
@@ -3226,6 +3273,7 @@ class CursorModel with ChangeNotifier {
   }
 
   CursorModel(this.parent) {
+    print('[RDFIX] cursor model up, [RDFIX] rustdesk-patched build edge-v1');
     // Made now, not when first drawn: nothing draws again when their decode lands, so the first
     // build that needs one would show the shape before in its place.
     preDefaultCursor.cache;
@@ -3371,52 +3419,89 @@ class CursorModel with ChangeNotifier {
     dx /= scale;
     dy /= scale;
     final r = getVisibleRect();
-    var cx = r.center.dx;
-    var cy = r.center.dy;
-    var tryMoveCanvasX = false;
     final displayRect = parent.target?.ffiModel.rect;
+
+    // [RDFIX] `r` is the part of the remote desktop currently on screen, in
+    // remote pixels. The pointer must be moved inside `r` first; the canvas is
+    // panned only once the pointer has actually reached the edge of `r` and the
+    // drag keeps pushing outwards.
+    //
+    // The original code panned as soon as `_x + dx > r.center.dx`, i.e. as soon
+    // as the pointer passed the middle of the screen, and it moved the pointer
+    // and the canvas by the same amount in opposite directions. The pointer
+    // therefore looked frozen in the middle of the screen while the image slid
+    // underneath it for the whole width of the hidden part of the desktop -
+    // "one finger drag only pans the picture". See rustdesk discussions #12744.
+    const double kEdgeEps = 0.01;
+    var tryMoveCanvasX = false;
     if (dx > 0) {
-      final maxCanvasCanMove = _displayOriginX +
-          (displayRect?.width ?? 1280) -
-          r.right.roundToDouble();
-      tryMoveCanvasX = _x + dx > cx && maxCanvasCanMove > 0;
-      if (tryMoveCanvasX) {
-        dx = min(dx, maxCanvasCanMove);
+      final room = r.right - _x;
+      if (room > kEdgeEps) {
+        dx = min(dx, room);
       } else {
-        final maxCursorCanMove = r.right - _x;
-        dx = min(dx, maxCursorCanMove);
+        final canvasRoom =
+            _displayOriginX + (displayRect?.width ?? 1280) - r.right;
+        if (canvasRoom > kEdgeEps) {
+          tryMoveCanvasX = true;
+          dx = min(dx, canvasRoom);
+        } else {
+          dx = 0;
+        }
       }
     } else if (dx < 0) {
-      final maxCanvasCanMove = _displayOriginX - r.left.roundToDouble();
-      tryMoveCanvasX = _x + dx < cx && maxCanvasCanMove < 0;
-      if (tryMoveCanvasX) {
-        dx = max(dx, maxCanvasCanMove);
+      final room = r.left - _x;
+      if (room < -kEdgeEps) {
+        dx = max(dx, room);
       } else {
-        final maxCursorCanMove = r.left - _x;
-        dx = max(dx, maxCursorCanMove);
+        final canvasRoom = _displayOriginX - r.left;
+        if (canvasRoom < -kEdgeEps) {
+          tryMoveCanvasX = true;
+          dx = max(dx, canvasRoom);
+        } else {
+          dx = 0;
+        }
       }
     }
     var tryMoveCanvasY = false;
     if (dy > 0) {
-      final mayCanvasCanMove = _displayOriginY +
-          (displayRect?.height ?? 720) -
-          r.bottom.roundToDouble();
-      tryMoveCanvasY = _y + dy > cy && mayCanvasCanMove > 0;
-      if (tryMoveCanvasY) {
-        dy = min(dy, mayCanvasCanMove);
+      final room = r.bottom - _y;
+      if (room > kEdgeEps) {
+        dy = min(dy, room);
       } else {
-        final mayCursorCanMove = r.bottom - _y;
-        dy = min(dy, mayCursorCanMove);
+        final canvasRoom =
+            _displayOriginY + (displayRect?.height ?? 720) - r.bottom;
+        if (canvasRoom > kEdgeEps) {
+          tryMoveCanvasY = true;
+          dy = min(dy, canvasRoom);
+        } else {
+          dy = 0;
+        }
       }
     } else if (dy < 0) {
-      final mayCanvasCanMove = _displayOriginY - r.top.roundToDouble();
-      tryMoveCanvasY = _y + dy < cy && mayCanvasCanMove < 0;
-      if (tryMoveCanvasY) {
-        dy = max(dy, mayCanvasCanMove);
+      final room = r.top - _y;
+      if (room < -kEdgeEps) {
+        dy = max(dy, room);
       } else {
-        final mayCursorCanMove = r.top - _y;
-        dy = max(dy, mayCursorCanMove);
+        final canvasRoom = _displayOriginY - r.top;
+        if (canvasRoom < -kEdgeEps) {
+          tryMoveCanvasY = true;
+          dy = max(dy, canvasRoom);
+        } else {
+          dy = 0;
+        }
       }
+    }
+
+    if (kRDFixTrace) {
+      String f(double v) => v.toStringAsFixed(1);
+      print('[RDFIX] pan raw=(${f(delta.dx)},${f(delta.dy)}) '
+          'pos=(${f(localPosition.dx)},${f(localPosition.dy)}) '
+          'touch=$touchMode scale=${scale.toStringAsFixed(4)} '
+          '_=(${f(_x)},${f(_y)}) '
+          'r=(${f(r.left)},${f(r.top)},${f(r.right)},${f(r.bottom)}) '
+          'canvas=(${f(parent.target?.canvasModel.x ?? 0)},'
+          '${f(parent.target?.canvasModel.y ?? 0)}) '
+          '-> d=(${f(dx)},${f(dy)}) tryX=$tryMoveCanvasX tryY=$tryMoveCanvasY');
     }
 
     if (dx == 0 && dy == 0) return;

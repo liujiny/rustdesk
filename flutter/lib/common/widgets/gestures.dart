@@ -21,6 +21,81 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
     _init();
   }
 
+  // [RDFIX] On this device ScaleGestureRecognizer keeps reporting
+  // ScaleUpdateDetails.scale == 1.0 while the two-finger span really changes,
+  // so the app-level zoom is a no-op. Track the span ourselves from the raw
+  // pointer positions and hand the app a corrected scale.
+  final Map<int, Offset> _rdPos = <int, Offset>{};
+  double _rdInitialSpan = 0.0;
+  double rdScale = 1.0;
+  int rdPointerCount = 0;
+
+  static double _rdSpanOf(Iterable<Offset> pts) {
+    final v = pts.toList();
+    if (v.length < 2) return 0.0;
+    var total = 0.0;
+    var n = 0;
+    for (var i = 0; i < v.length; i++) {
+      for (var j = i + 1; j < v.length; j++) {
+        total += (v[i] - v[j]).distance;
+        n++;
+      }
+    }
+    return n == 0 ? 0.0 : total / n;
+  }
+
+  void _rdDropPointer(int pointer) {
+    _rdPos.remove(pointer);
+    if (_rdPos.length < 2) {
+      _rdInitialSpan = 0.0;
+      rdScale = 1.0;
+    }
+    rdPointerCount = _rdPos.length;
+  }
+
+  @override
+  void handleEvent(PointerEvent event) {
+    if (event is PointerDownEvent || event is PointerMoveEvent) {
+      _rdPos[event.pointer] = event.position;
+    } else if (event is PointerUpEvent || event is PointerCancelEvent) {
+      _rdPos.remove(event.pointer);
+    }
+    if (_rdPos.length < 2) {
+      _rdInitialSpan = 0.0;
+      rdScale = 1.0;
+    } else {
+      final span = _rdSpanOf(_rdPos.values);
+      if (_rdInitialSpan <= 0.0) {
+        // Only latch once the two contacts are clearly apart; a pair that
+        // starts a few pixels apart would produce a huge ratio (and the
+        // framework itself divides by that zero span, yielding 0/Infinity).
+        if (span >= 24.0) _rdInitialSpan = span;
+      } else if (span > 0.0) {
+        rdScale = (span / _rdInitialSpan).clamp(0.25, 4.0).toDouble();
+      }
+    }
+    rdPointerCount = _rdPos.length;
+    super.handleEvent(event);
+  }
+
+  ScaleUpdateDetails _rdFixScale(ScaleUpdateDetails d) {
+    // Always hand over our own scale: ScaleGestureRecognizer reports 1.0, 0.0
+    // and Infinity on this device, and anything non-finite wrecks the canvas.
+    final s = (rdScale.isFinite && rdScale > 0.0) ? rdScale : 1.0;
+    if (d.scale == s) return d;
+    return ScaleUpdateDetails(
+      scale: rdScale,
+      horizontalScale: d.horizontalScale,
+      verticalScale: d.verticalScale,
+      focalPoint: d.focalPoint,
+      localFocalPoint: d.localFocalPoint,
+      rotation: d.rotation,
+      pointerCount: d.pointerCount,
+      focalPointDelta: d.focalPointDelta,
+      sourceTimeStamp: d.sourceTimeStamp,
+    );
+  }
+
   // oneFingerPan
   GestureDragStartCallback? onOneFingerPanStart;
   GestureDragUpdateCallback? onOneFingerPanUpdate;
@@ -37,6 +112,20 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
   GestureDragUpdateCallback? onThreeFingerVerticalDragUpdate;
   GestureDragEndCallback? onThreeFingerVerticalDragEnd;
 
+  // [RDFIX] Some devices deliver one physical contact as two coincident
+  // pointers. That made a single-finger drag look like a two-finger gesture
+  // (the app then only panned the canvas and never moved the pointer), and it
+  // made ScaleGestureRecognizer divide by a zero span (scale 0/Infinity).
+  // Count distinct touch points instead of raw pointer slots.
+  int get _rdEffectivePointerCount {
+    if (_rdPos.length <= 1) return _rdPos.length;
+    final kept = <Offset>[];
+    for (final p in _rdPos.values) {
+      if (!kept.any((k) => (k - p).distance < 24.0)) kept.add(p);
+    }
+    return kept.length;
+  }
+
   var _currentState = GestureState.none;
   Timer? _debounceTimer;
 
@@ -45,41 +134,58 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
     // onStart = (d) {};
     onUpdate = (d) {
       _debounceTimer?.cancel();
-      if (d.pointerCount == 1 && _currentState != GestureState.oneFingerPan) {
-        onOneFingerStartDebounce(d);
-      } else if (d.pointerCount == 2 &&
-          _currentState != GestureState.twoFingerScale) {
-        onTwoFingerStartDebounce(d);
-      } else if (d.pointerCount == 3 &&
-          _currentState != GestureState.threeFingerVerticalDrag) {
-        _currentState = GestureState.threeFingerVerticalDrag;
-        if (onThreeFingerVerticalDragStart != null) {
-          onThreeFingerVerticalDragStart!(
-              DragStartDetails(globalPosition: d.localFocalPoint));
-        }
-        debugPrint("start threeFingerScale");
+      final rdPc = _rdEffectivePointerCount;
+      if (d.pointerCount != rdPc) {
+        debugPrint('[RDFIX] dup pointers raw=${d.pointerCount} eff=$rdPc');
       }
-      if (_currentState != GestureState.none) {
+
+      // [RDFIX] end the previous mode before switching, so each callback pair
+      // (start/end) stays balanced.
+      void endCurrent() {
         switch (_currentState) {
           case GestureState.oneFingerPan:
-            if (onOneFingerPanUpdate != null) {
-              onOneFingerPanUpdate!(_getDragUpdateDetails(d));
-            }
+            onOneFingerPanEnd?.call(DragEndDetails(velocity: Velocity.zero));
             break;
           case GestureState.twoFingerScale:
-            if (onTwoFingerScaleUpdate != null) {
-              onTwoFingerScaleUpdate!(d);
-            }
+            onTwoFingerScaleEnd?.call(ScaleEndDetails(velocity: Velocity.zero));
             break;
           case GestureState.threeFingerVerticalDrag:
-            if (onThreeFingerVerticalDragUpdate != null) {
-              onThreeFingerVerticalDragUpdate!(_getDragUpdateDetails(d));
-            }
+            onThreeFingerVerticalDragEnd
+                ?.call(DragEndDetails(velocity: Velocity.zero));
             break;
           default:
             break;
         }
-        return;
+        _currentState = GestureState.none;
+      }
+
+      if (rdPc >= 3) {
+        if (_currentState != GestureState.threeFingerVerticalDrag) {
+          endCurrent();
+          _currentState = GestureState.threeFingerVerticalDrag;
+          debugPrint("start threeFingerScale");
+          onThreeFingerVerticalDragStart?.call(
+              DragStartDetails(globalPosition: d.localFocalPoint));
+        }
+        onThreeFingerVerticalDragUpdate?.call(_getDragUpdateDetails(d));
+      } else if (rdPc == 2) {
+        if (_currentState != GestureState.twoFingerScale) {
+          endCurrent();
+          _currentState = GestureState.twoFingerScale;
+          debugPrint("start twoFingerScale");
+          onTwoFingerScaleStart?.call(ScaleStartDetails(
+              localFocalPoint: d.localFocalPoint, focalPoint: d.focalPoint));
+        }
+        onTwoFingerScaleUpdate?.call(_rdFixScale(d));
+      } else if (rdPc == 1) {
+        if (_currentState != GestureState.oneFingerPan) {
+          endCurrent();
+          _currentState = GestureState.oneFingerPan;
+          debugPrint("start oneFingerPan");
+          onOneFingerPanStart?.call(DragStartDetails(
+              localPosition: d.localFocalPoint, globalPosition: d.focalPoint));
+        }
+        onOneFingerPanUpdate?.call(_getDragUpdateDetails(d));
       }
     };
     onEnd = (d) {
@@ -114,9 +220,10 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
         default:
           break;
       }
-      _debounceTimer = Timer(Duration(milliseconds: 200), () {
-        _currentState = GestureState.none;
-      });
+      // [RDFIX] reset immediately. The 200 ms timer here was cancelled by the
+      // next touch's onUpdate, so the state stayed on twoFingerScale /
+      // threeFingerVerticalDrag forever and the next gestures were misrouted.
+      _currentState = GestureState.none;
     };
   }
 
@@ -174,6 +281,9 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
   @override
   void rejectGesture(int pointer) {
     super.rejectGesture(pointer);
+    // [RDFIX] a rejected pointer never reports its up event, so drop it here or
+    // it stays in _rdPos forever and inflates the finger count.
+    _rdDropPointer(pointer);
     switch (_currentState) {
       case GestureState.oneFingerPan:
         if (onOneFingerPanCancel != null) {
@@ -190,6 +300,21 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
         break;
     }
     _currentState = GestureState.none;
+  }
+
+  @override
+  void didStopTrackingLastPointer(int pointer) {
+    super.didStopTrackingLastPointer(pointer);
+    _rdPos.clear();
+    _rdInitialSpan = 0.0;
+    rdScale = 1.0;
+    rdPointerCount = 0;
+  }
+
+  @override
+  void dispose() {
+    _rdPos.clear();
+    super.dispose();
   }
 }
 
